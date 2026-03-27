@@ -1,14 +1,15 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::State,
     http::{HeaderName, Request, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::any,
 };
+use futures_util::{Stream, StreamExt};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
@@ -19,9 +20,9 @@ use tower::ServiceExt;
 use crate::{config::ProxyConfig, logging};
 
 /// Cap request bodies to prevent memory exhaustion from oversized uploads.
-const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+const MAX_REQUEST_BODY_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 /// Cap upstream response bodies to the same limit.
-const MAX_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+const MAX_RESPONSE_BODY_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 /// Timeout for connecting to the upstream HTTP server.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Overall timeout for an upstream HTTP round-trip.
@@ -246,20 +247,14 @@ async fn forward(
     let headers = upstream_resp.headers().clone();
     let content_length = upstream_resp.content_length().unwrap_or(0);
     if content_length > MAX_RESPONSE_BODY_BYTES as u64 {
-        return Ok(Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("upstream response body too large"))
-            .expect("static response must build"));
-    }
-    let body = upstream_resp
-        .bytes()
-        .await
-        .context("failed to read upstream response body")?;
-    if body.len() > MAX_RESPONSE_BODY_BYTES {
-        return Ok(Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("upstream response body too large"))
-            .expect("static response must build"));
+        logging::error(
+            "PROXY",
+            &format!(
+                "upstream response exceeds {} bytes limit",
+                MAX_RESPONSE_BODY_BYTES
+            ),
+        );
+        return Ok(upstream_response_too_large());
     }
 
     let mut resp = Response::builder().status(status);
@@ -269,8 +264,45 @@ async fn forward(
         }
     }
 
-    resp.body(Body::from(body))
+    let body = Body::from_stream(limit_response_stream(
+        upstream_resp.bytes_stream(),
+        MAX_RESPONSE_BODY_BYTES,
+    ));
+
+    resp.body(body)
         .map_err(|e| anyhow!("failed to build response: {}", e))
+}
+
+fn upstream_response_too_large() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from("upstream response body too large"))
+        .expect("static response must build")
+}
+
+fn limit_response_stream<S, E>(
+    stream: S,
+    limit: usize,
+) -> impl Stream<Item = Result<Bytes, io::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut total = 0usize;
+
+    stream.map(move |chunk| {
+        let chunk = chunk.map_err(io::Error::other)?;
+        total = total.saturating_add(chunk.len());
+        if total > limit {
+            logging::error(
+                "PROXY",
+                &format!("upstream response exceeds {} bytes limit", limit),
+            );
+            return Err(io::Error::other("upstream response body too large"));
+        }
+
+        Ok(chunk)
+    })
 }
 
 fn build_target_url(base_url: &str, uri: &Uri) -> String {
@@ -317,12 +349,18 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use axum::{
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         http::{HeaderName, Uri},
     };
+    use futures_util::stream;
 
-    use super::{MAX_REQUEST_BODY_BYTES, build_target_url, is_hop_by_hop, normalize_host};
+    use super::{
+        MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BODY_BYTES, build_target_url, is_hop_by_hop,
+        limit_response_stream, normalize_host,
+    };
 
     #[test]
     fn normalize_host_removes_port() {
@@ -375,6 +413,30 @@ mod tests {
         let oversized = vec![0u8; MAX_REQUEST_BODY_BYTES + 1];
         let body = Body::from(oversized);
         let result = to_bytes(body, MAX_REQUEST_BODY_BYTES).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn response_stream_within_limit_is_forwarded() {
+        let stream = stream::iter(vec![Ok::<_, io::Error>(Bytes::from(vec![0u8; 1024]))]);
+        let body = Body::from_stream(limit_response_stream(stream, MAX_RESPONSE_BODY_BYTES));
+
+        let result = to_bytes(body, MAX_RESPONSE_BODY_BYTES).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn response_stream_exceeding_limit_fails() {
+        let stream = stream::iter(vec![
+            Ok::<_, io::Error>(Bytes::from(vec![0u8; MAX_RESPONSE_BODY_BYTES])),
+            Ok::<_, io::Error>(Bytes::from(vec![0u8; 1])),
+        ]);
+        let body = Body::from_stream(limit_response_stream(stream, MAX_RESPONSE_BODY_BYTES));
+
+        let result = to_bytes(body, MAX_RESPONSE_BODY_BYTES + 1).await;
+
         assert!(result.is_err());
     }
 }

@@ -45,7 +45,7 @@ One command, one `sudo`, one process for all local development.
 
 `sptth` is designed for **local development only** and should not be exposed to untrusted networks.
 
-- The reverse proxy enforces a **10 MiB request body limit** (request and response) to prevent memory exhaustion.
+- The reverse proxy enforces a **100 MiB request body limit** (request and response) to prevent memory exhaustion.
 - Concurrent proxy connections are capped at **512** and DNS handler tasks at **256**.
 - Upstream HTTP requests have a **5 s connect timeout** and **30 s overall timeout**; TLS handshakes time out after **10 s**.
 - DNS forwarding **validates the source address** of upstream responses to reject spoofed packets.
